@@ -1,12 +1,55 @@
-const core = require("@actions/core");
-const { exec } = require("@actions/exec");
-const github = require("@actions/github");
-const os = require("os");
-const path = require("path");
-const { execSync } = require("child_process");
+import * as core from "@actions/core";
+import { exec } from "@actions/exec";
+import * as github from "@actions/github";
+import os from "os";
+import path from "path";
+import fs from "fs";
+import { execSync } from "child_process";
 
 const meta = { dist_interface: "github-actions" };
 process.env["DOC_DETECTIVE_META"] = JSON.stringify(meta);
+
+const INTEGRATION_MAP: Record<string, string> = {
+  "doc-sentinel": "\n/cc @reem-sab",
+  "promptless": "\n@promptless $PROMPT",
+  "dosu": "\n@dosu $PROMPT",
+  "claude": "\n@claude $PROMPT",
+  "opencode": "\n/opencode $PROMPT",
+  "cursor": "\n@cursor $PROMPT",
+};
+
+// All valid integration names (INTEGRATION_MAP keys + special-case integrations)
+const VALID_INTEGRATIONS = new Set([...Object.keys(INTEGRATION_MAP), "copilot"]);
+
+function parseIntegrations(integrationsInput: string): string[] {
+  if (!integrationsInput || !integrationsInput.trim()) return [];
+
+  const requested = integrationsInput.split(",").map((s) => s.trim().toLowerCase()).filter((s) => s.length > 0);
+  const valid: string[] = [];
+
+  for (const name of requested) {
+    if (VALID_INTEGRATIONS.has(name)) {
+      valid.push(name);
+    } else {
+      core.warning(
+        `Unknown integration "${name}". Supported integrations: ${[...VALID_INTEGRATIONS].join(", ")}`
+      );
+    }
+  }
+
+  return valid;
+}
+
+function buildIntegrationsAccordion(integrations: string[], prompt: string): string {
+  const accordionEntries = integrations
+    .filter((name) => name !== "copilot")
+    .map((name) => INTEGRATION_MAP[name].replace("$PROMPT", prompt))
+    .filter(Boolean);
+
+  if (accordionEntries.length === 0) return "";
+
+  return `\n\n<details>\n<summary>Integrations</summary>\n${accordionEntries.join("\n")}\n</details>`;
+}
 
 const repoOwner = github.context.repo.owner;
 const repoName = github.context.repo.repo;
@@ -15,7 +58,7 @@ const runURL = `https://github.com/${repoOwner}/${repoName}/actions/runs/${runId
 
 main();
 
-async function main() {
+async function main(): Promise<void> {
   try {
     // Post warning if running on Linux
     if (os.platform() === "linux") {
@@ -40,7 +83,7 @@ async function main() {
     if (config) compiledCommand += ` --config ${config}`;
     if (input) compiledCommand += ` --input ${input}`;
     const outputPath = path.resolve(
-      process.env.RUNNER_TEMP,
+      process.env.RUNNER_TEMP || os.tmpdir(),
       "doc-detective-output.json"
     );
     compiledCommand += ` --output ${outputPath}`;
@@ -50,13 +93,12 @@ async function main() {
     core.info(`Working directory: ${cwd}`);
 
     let commandOutputData = "";
-    const options = {
-      // Full options: https://github.com/actions/toolkit/blob/d9347d4ab99fd507c0b9104b2cf79fb44fcc827d/packages/exec/src/interfaces.ts
+    const options: Parameters<typeof exec>[2] = {
       cwd,
-    };
-    options.listeners = {
-      stdout: (data) => {
-        commandOutputData += data.toString();
+      listeners: {
+        stdout: (data: Buffer) => {
+          commandOutputData += data.toString();
+        },
       },
     };
     await exec(compiledCommand, [], options);
@@ -65,35 +107,34 @@ async function main() {
     // If output file is not found, throw an error
     if (!outputFile) {
       throw new Error(
-        `Output file not found.\nOutput file: ${outputFile}\nCWD: ${process.cwd()}\nstdout: ${
-          commandOutputData
-        }`
+        `Output file not found.\nOutput file: ${outputFile}\nCWD: ${process.cwd()}\nstdout: ${commandOutputData}`
       );
     }
 
     // Set outputs
-    const results = require(outputFile);
+    const results = JSON.parse(fs.readFileSync(outputFile, "utf-8"));
     core.setOutput("results", results);
 
     // Create a pull request if there are changed files
     if (core.getInput("create_pr_on_change") == "true") {
       core.info("Checking for changed files.");
       // Check if git is available
-      let hasGit;
+      let hasGit = false;
       try {
         const gitVersionCheck = execSync("git --version");
         if (gitVersionCheck.toString()) hasGit = true;
-      } catch (error) {
+      } catch {
         core.warning("Git isn't available. Skipping change checking.");
       }
 
       if (hasGit) {
-        let changedFiles;
+        let changedFiles = false;
+        let status = "";
 
         // Check if there are changed files
         try {
           const statusResponse = execSync("git status");
-          const status = statusResponse.toString();
+          status = statusResponse.toString();
           if (!status.includes("working tree clean")) changedFiles = true;
           if (status.includes("not a git repository")) {
             core.warning(
@@ -101,7 +142,7 @@ async function main() {
             );
           }
         } catch (error) {
-          core.warning(`Error checking for changed files: ${error.message}`);
+          core.warning(`Error checking for changed files: ${(error as Error).message}`);
         }
 
         if (changedFiles) {
@@ -110,11 +151,11 @@ async function main() {
 
           // Create a pull request if there are changed files
           try {
-            const pr = await createPullRequest(status);
+            const pr = await createPullRequest();
             core.setOutput("pull_request_url", pr.data.html_url);
             core.info(`Pull Request: ${JSON.stringify(pr)}`);
           } catch (error) {
-            core.error(`Error creating pull request: ${error.message}`);
+            core.error(`Error creating pull request: ${(error as Error).message}`);
           }
         }
       }
@@ -129,7 +170,7 @@ async function main() {
           core.setOutput("issue_url", issue.data.html_url);
           core.info(`Issue: ${JSON.stringify(issue)}`);
         } catch (error) {
-          core.error(`Error creating issue: ${error.message}`);
+          core.error(`Error creating issue: ${(error as Error).message}`);
         }
       }
       if (core.getInput("exit_on_fail") == "true") {
@@ -138,47 +179,61 @@ async function main() {
       }
     }
   } catch (error) {
-    core.setFailed(error.message);
+    core.setFailed((error as Error).message);
   }
 }
 
-/**
- * Creates an issue using the provided inputs.
- *
- * @param {string} results - The results to be included in the issue body.
- * @returns {Promise<object>} - A promise that resolves to the created issue object.
- */
-async function createIssue(results) {
+async function createIssue(results: string) {
   const token = core.getInput("token");
   const title = core.getInput("issue_title");
+  const prompt = core.getInput("prompt");
+  const integrations = parseIntegrations(core.getInput("integrations"));
+  const integrationsAccordion = buildIntegrationsAccordion(integrations, prompt);
   const body = core
     .getInput("issue_body")
-    .replace("$RUN_URL", runURL)
-    .replace("$RESULTS", `\n\n\`\`\`json\n${results}\n\`\`\``);
-  const labels = core.getInput("issue_labels");
-  const assignees = core.getInput("issue_assignees");
+    .replaceAll("$RUN_URL", runURL)
+    .replaceAll("$RESULTS", `\n\n\`\`\`json\n${results}\n\`\`\``)
+    .replaceAll("$PROMPT", prompt)
+    + integrationsAccordion;
+  const labelsList = core.getInput("issue_labels").split(",").map((s) => s.trim()).filter(Boolean);
+  const assigneesList = core.getInput("issue_assignees").split(",").map((s) => s.trim()).filter(Boolean);
+  if (integrations.includes("copilot") && !assigneesList.includes("copilot-swe-agent")) {
+    assigneesList.push("copilot-swe-agent");
+  }
 
   const octokit = github.getOctokit(token);
 
-  const issue = await octokit.rest.issues.create({
-    owner: github.context.repo.owner,
-    repo: github.context.repo.repo,
-    title,
-    body,
-    labels: labels.split(","),
-    assignees: assignees.split(","),
-  });
+  // Try creating the issue; if assignees cause a 422, retry without them
+  let issue;
+  try {
+    issue = await octokit.rest.issues.create({
+      owner: github.context.repo.owner,
+      repo: github.context.repo.repo,
+      title,
+      body,
+      labels: labelsList,
+      assignees: assigneesList,
+    });
+  } catch (error) {
+    if ((error as { status?: number }).status === 422) {
+      core.warning(`Issue creation failed with assignees (${assigneesList.join(", ")}). Retrying without assignees.`);
+      issue = await octokit.rest.issues.create({
+        owner: github.context.repo.owner,
+        repo: github.context.repo.repo,
+        title,
+        body,
+        labels: labelsList,
+      });
+    } else {
+      throw error;
+    }
+  }
 
   core.info(`Issue created: ${issue.data.html_url}`);
   core.setOutput("issueUrl", issue.data.html_url);
   return issue;
 }
 
-/**
- * Creates a pull request with the specified parameters.
- *
- * @returns {Promise<object>} - A promise that resolves when the pull request is created.
- */
 async function createPullRequest() {
   const token = core.getInput("token");
   const title = core.getInput("pr_title");
@@ -211,17 +266,16 @@ async function createPullRequest() {
   await exec(`git push origin ${head}`);
 
   // Create pull request
-  try {
-    core.info(`Creating pull request.`);
-    const pr = await octokit.rest.pulls.create({
-      owner: github.context.repo.owner,
-      repo: github.context.repo.repo,
-      title,
-      body,
-      head,
-      base,
-    });
+  const pr = await octokit.rest.pulls.create({
+    owner: github.context.repo.owner,
+    repo: github.context.repo.repo,
+    title,
+    body,
+    head,
+    base,
+  });
 
+  try {
     // Add labels, reviewers, and assignees
     core.info(`Adding labels.`);
     await octokit.request(
@@ -230,7 +284,7 @@ async function createPullRequest() {
         owner: github.context.repo.owner,
         repo: github.context.repo.repo,
         issue_number: pr.data.number,
-        labels: labels.split(","),
+        labels: labels.split(",").map((s) => s.trim()).filter(Boolean),
       }
     );
     core.info(`Adding assignees.`);
@@ -240,7 +294,7 @@ async function createPullRequest() {
         owner: github.context.repo.owner,
         repo: github.context.repo.repo,
         issue_number: pr.data.number,
-        assignees: assignees.split(","),
+        assignees: assignees.split(",").map((s) => s.trim()).filter(Boolean),
       }
     );
     core.info(`Adding reviewers.`);
@@ -250,16 +304,16 @@ async function createPullRequest() {
         owner: github.context.repo.owner,
         repo: github.context.repo.repo,
         pull_number: pr.data.number,
-        reviewers: reviewers.split(","),
+        reviewers: reviewers.split(",").map((s) => s.trim()).filter(Boolean),
       }
     );
   } catch (error) {
-    if (error.status === 403) {
+    if ((error as { status?: number }).status === 403) {
       core.error(
         "Doc Detective doesn't have permissions to create pull requests. Make sure the workflow or job has write permissions for pull requests and that you've allowed GitHub Actions to create pull requests."
       );
     } else {
-      throw core.error(error);
+      core.error(error as Error);
     }
   }
 
