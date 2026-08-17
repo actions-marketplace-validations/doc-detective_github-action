@@ -84,6 +84,46 @@ Path to the input file or directory. Overrides the "input" field in the config f
     input: path/to/your/tests
 ```
 
+### `android` (default: `auto`)
+
+Enable Android emulator support on Linux runners by granting KVM access (the emulator needs hardware acceleration). `auto` scans your specs and only sets up KVM when an `android` platform is present; `true` always sets it up; `false` never does. No effect on macOS/Windows runners. Doc Detective bootstraps the SDK, emulator, system image, AVD, and driver itself at test time.
+
+```yaml
+- uses: doc-detective/github-action@v1
+  with:
+    android: auto
+```
+
+### `ios` (deprecated, no-op)
+
+**Deprecated.** This input used to cache the WebDriverAgent (WDA) build across runs. Doc Detective (v4.28+) now prebuilds and manages WDA itself — `doc-detective install ios --yes` compiles it once into the Doc Detective cache, keyed by your Xcode and XCUITest driver versions, and test sessions consume the products automatically. The action-side cache was redundant next to that (running both double-built WDA), so it was retired; the input is accepted for compatibility but does nothing beyond a migration notice.
+
+For fast iOS runs, persist the Doc Detective cache and prebuild before the action:
+
+```yaml
+jobs:
+  runTests:
+    runs-on: macos-latest
+    env:
+      DOC_DETECTIVE_CACHE_DIR: ${{ github.workspace }}/.dd-cache
+    steps:
+      - uses: actions/checkout@v4
+      # Rotating key + restore-keys: an exact cache hit never re-uploads, so a
+      # static key would strand WDA products built for a NEW Xcode/driver
+      # toolchain. The run-scoped key always saves; restore-keys pulls the
+      # newest previous entry.
+      - uses: actions/cache@v4
+        with:
+          path: .dd-cache
+          key: dd-cache-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            dd-cache-${{ runner.os }}-
+      - run: npx doc-detective install ios --yes
+      - uses: doc-detective/github-action@v1
+```
+
+Without the prebuild, iOS tests still work — the first XCUITest session builds WebDriverAgent in-session (~10 min on a cold runner). The managed prebuild requires Doc Detective v4.28 or later.
+
 ### `create_pr_on_change` (default: `false`)
 
 Create a pull request if any files in the repo change, such as if screenshots or command results get updated. Only valid if `command` is `runTests`. Commits, branches, and pull requests are created with the credentials of the workflow run that triggered the action.

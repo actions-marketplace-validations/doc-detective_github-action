@@ -5,6 +5,12 @@ import os from "os";
 import path from "path";
 import fs from "fs";
 import { execSync } from "child_process";
+import { loadResults } from "./loadResults.ts";
+import { shouldSetUpAndroid, enableLinuxKvm } from "./androidSetup.ts";
+import {
+  shouldNoticeRetiredWdaCache,
+  WDA_CACHE_RETIREMENT_NOTICE,
+} from "./iosSetup.ts";
 
 const meta = { dist_interface: "github-actions" };
 process.env["DOC_DETECTIVE_META"] = JSON.stringify(meta);
@@ -68,10 +74,59 @@ async function main(): Promise<void> {
     }
     // Get the inputs
     const version = core.getInput("version");
-    const dd = `doc-detective@${version}`;
+    // An empty `version` means "use whatever doc-detective is already resolvable
+    // from the working directory" — e.g. a locally-built checkout exposed via
+    // `npm link`, so a repo can dog-food the action against its own build under
+    // review rather than the published package. Pinning `doc-detective@<tag>`
+    // (even `@latest`) makes npx resolve from the registry and ignore a linked
+    // local build, so omit the `@version` suffix entirely when version is blank.
+    const dd = version ? `doc-detective@${version}` : "doc-detective";
     const cwd = core.getInput("working_directory");
     const config = core.getInput("config");
     const input = core.getInput("input");
+
+    // Android emulator support: on Linux, grant KVM access so the emulator can
+    // accelerate. Driven by the `android` input ("auto" | "true" | "false");
+    // "auto" scans the specs and sets up KVM only when an android platform is
+    // present. Everything else (SDK, emulator, image, driver) Doc Detective
+    // bootstraps itself at test time.
+    const androidInput = core.getInput("android");
+    const scanRoots = [input, config, cwd]
+      .filter((p) => p && p.length > 0)
+      .map((p) => path.resolve(cwd || ".", p));
+    const androidDecision = shouldSetUpAndroid({
+      androidInput,
+      platform: os.platform(),
+      roots: scanRoots.length ? scanRoots : [path.resolve(cwd || ".")],
+    });
+    core.info(
+      `Android setup: ${androidDecision.setUp ? "enabled" : "skipped"} (${androidDecision.reason}).`
+    );
+    if (androidDecision.setUp) {
+      await enableLinuxKvm({
+        existsSync: (p) => fs.existsSync(p),
+        exec: (command, args) => exec(command, args),
+        info: (m) => core.info(m),
+        warning: (m) => core.warning(m),
+      });
+    }
+
+    // The iOS WebDriverAgent build cache is RETIRED (see iosSetup.ts):
+    // Doc Detective v4.28+ prebuilds and manages WDA products itself
+    // (`install ios`), keyed by Xcode × driver version, which the
+    // action-side derivedData cache both duplicated (double builds when
+    // both ran) and undercut (its driver-blind key was the stale-cache
+    // session-timeout mode). The `ios` input is a deprecated no-op; runs
+    // that would have used the cache get a one-line migration notice.
+    const iosInput = core.getInput("ios");
+    const iosNotice = shouldNoticeRetiredWdaCache({
+      iosInput,
+      platform: os.platform(),
+      roots: scanRoots.length ? scanRoots : [path.resolve(cwd || ".")],
+    });
+    if (iosNotice.notify) {
+      core.notice(WDA_CACHE_RETIREMENT_NOTICE);
+    }
 
     // Compile command
     let compiledCommand = `npx ${dd}`;
@@ -102,17 +157,12 @@ async function main(): Promise<void> {
       },
     };
     await exec(compiledCommand, [], options);
-    const outputFiles = commandOutputData.split("results at ");
-    const outputFile = outputFiles[outputFiles.length - 1].trim();
-    // If output file is not found, throw an error
-    if (!outputFile) {
-      throw new Error(
-        `Output file not found.\nOutput file: ${outputFile}\nCWD: ${process.cwd()}\nstdout: ${commandOutputData}`
-      );
-    }
 
-    // Set outputs
-    const results = JSON.parse(fs.readFileSync(outputFile, "utf-8"));
+    // Read results from the file we passed via `--output`, not from stdout.
+    // Doc Detective's log text is human-facing and free to change (e.g. extra
+    // "See per-run ..." lines), and scraping the path back out of it coupled
+    // this action to that format and broke it. See doc-detective#346.
+    const results = loadResults(outputPath, commandOutputData);
     core.setOutput("results", results);
 
     // Create a pull request if there are changed files
@@ -162,7 +212,7 @@ async function main(): Promise<void> {
     }
 
     // Create an issue if there are failing tests
-    if (results.summary.specs.fail > 0) {
+    if (results?.summary?.specs?.fail > 0) {
       if (core.getInput("create_issue_on_fail") == "true") {
         // Create an issue if there are failing tests
         try {
